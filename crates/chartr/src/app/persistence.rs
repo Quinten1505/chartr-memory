@@ -49,11 +49,11 @@ mod tests {
         }
     }
 
-    fn assert_failed_restore_preserves_database(damage: &str) {
+    fn assert_failed_restore_preserves_database(damage: impl FnOnce(&rusqlite::Connection)) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite");
         StateStore::open(&path).unwrap().save(&saved_workspace()).unwrap();
-        rusqlite::Connection::open(&path).unwrap().execute_batch(damage).unwrap();
+        damage(&rusqlite::Connection::open(&path).unwrap());
         let before = std::fs::read(&path).unwrap();
 
         let (mut store, fallback, problem) = restore_state(Ok(path.clone()));
@@ -79,16 +79,55 @@ mod tests {
 
     #[test]
     fn malformed_space_preserves_healthy_layouts_and_plugin_state() {
-        assert_failed_restore_preserves_database(
-            "INSERT INTO spaces (space_key, ordinal, value_json) VALUES ('damaged', 1, '{')",
-        );
+        assert_failed_restore_preserves_database(|connection| {
+            connection
+                .execute_batch(
+                    "INSERT INTO spaces (space_key, ordinal, value_json) VALUES ('damaged', 1, '{')",
+                )
+                .unwrap();
+        });
     }
 
     #[test]
     fn malformed_window_state_disables_saving_too() {
-        assert_failed_restore_preserves_database(
-            "UPDATE app_state SET value_json = '{' WHERE key = 'window'",
-        );
+        assert_failed_restore_preserves_database(|connection| {
+            connection
+                .execute_batch("UPDATE app_state SET value_json = '{' WHERE key = 'window'")
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn structurally_invalid_layout_cannot_overwrite_saved_state() {
+        assert_failed_restore_preserves_database(|connection| {
+            let mut space = serde_json::to_value(&saved_workspace().spaces[0]).unwrap();
+            space["layout"]["tabs"][0]["layout"]["panes_by_item"] = serde_json::json!({});
+            connection
+                .execute(
+                    "UPDATE spaces SET value_json = ?1 WHERE space_key = 'healthy'",
+                    [space.to_string()],
+                )
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn empty_saved_pane_axis_cannot_overwrite_saved_state() {
+        assert_failed_restore_preserves_database(|connection| {
+            let mut space = serde_json::to_value(&saved_workspace().spaces[0]).unwrap();
+            space["layout"]["tabs"][0]["layout"]["center"]["root"] = serde_json::json!({
+                "kind": "axis",
+                "axis": "horizontal",
+                "members": [],
+                "flexes": []
+            });
+            connection
+                .execute(
+                    "UPDATE spaces SET value_json = ?1 WHERE space_key = 'healthy'",
+                    [space.to_string()],
+                )
+                .unwrap();
+        });
     }
 
     #[test]

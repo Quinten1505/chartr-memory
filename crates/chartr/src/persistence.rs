@@ -218,7 +218,13 @@ impl StateStore {
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         let mut spaces = Vec::new();
         for row in rows {
-            spaces.push(serde_json::from_str(&row?).context("decoding a saved space")?);
+            let space: PersistedSpace =
+                serde_json::from_str(&row?).context("decoding a saved space")?;
+            space
+                .layout
+                .validate()
+                .with_context(|| format!("validating saved workspace layout for {}", space.key))?;
+            spaces.push(space);
         }
         Ok(Snapshot { window, spaces })
     }
@@ -359,6 +365,26 @@ mod tests {
         let restored = store.load().unwrap();
         assert_eq!(restored, snapshot);
         restored.spaces[0].layout.validate().unwrap();
+    }
+
+    #[test]
+    fn structurally_invalid_saved_layout_is_rejected() {
+        let mut store = StateStore::memory().unwrap();
+        let saved = space("healthy");
+        store.save(&Snapshot { spaces: vec![saved.clone()], ..Snapshot::default() }).unwrap();
+
+        let mut value = serde_json::to_value(saved).unwrap();
+        value["layout"]["tabs"][0]["layout"]["panes_by_item"] = serde_json::json!({});
+        store
+            .connection
+            .execute(
+                "UPDATE spaces SET value_json = ?1 WHERE space_key = 'healthy'",
+                [value.to_string()],
+            )
+            .unwrap();
+
+        let error = store.load().unwrap_err();
+        assert!(format!("{error:#}").contains("validating saved workspace layout for healthy"));
     }
 
     #[test]

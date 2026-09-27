@@ -78,6 +78,24 @@ pub enum Member {
 }
 
 impl Member {
+    fn validate_shape(&self) -> Result<(), ModelError> {
+        if let Self::Axis(axis) = self {
+            if axis.members.len() < 2 {
+                return Err(ModelError::InvalidPaneTree);
+            }
+            if axis.flexes.len() != axis.members.len()
+                || axis.flexes.iter().any(|flex| !flex.is_finite() || *flex <= 0.)
+                || !axis.flexes.iter().sum::<f32>().is_finite()
+            {
+                return Err(ModelError::InvalidFlexes);
+            }
+            for member in &axis.members {
+                member.validate_shape()?;
+            }
+        }
+        Ok(())
+    }
+
     fn pane(pane: PaneId) -> Self {
         Self::Pane { pane }
     }
@@ -668,8 +686,8 @@ impl Workspace {
         Ok(())
     }
 
-    #[cfg(test)]
     pub fn validate(&self) -> Result<(), ModelError> {
+        self.center.root.validate_shape()?;
         let tree_panes = self.center.panes();
         let tree_set: HashSet<_> = tree_panes.iter().copied().collect();
         let model_set: HashSet<_> = self.panes.keys().copied().collect();
@@ -678,6 +696,9 @@ impl Workspace {
         }
         if !tree_set.contains(&self.active_pane) {
             return Err(ModelError::PaneNotFound(self.active_pane));
+        }
+        if self.next_pane_id <= self.panes.keys().map(|pane| pane.get()).max().unwrap_or(0) {
+            return Err(ModelError::InvalidPaneTree);
         }
 
         let mut seen = HashSet::new();
@@ -1112,12 +1133,13 @@ impl WorkspaceTabs {
         }
     }
 
-    #[cfg(test)]
     pub fn validate(&self) -> Result<(), ModelError> {
         let mut tabs = HashSet::new();
         let mut items = HashSet::new();
         for tab in &self.tabs {
-            if !tabs.insert(tab.id) || tab.layout.is_empty() {
+            // Older snapshots can contain empty outer tabs. Restoration prunes
+            // them after loading the layout and its item records.
+            if !tabs.insert(tab.id) {
                 return Err(ModelError::InvalidWorkspaceTabs);
             }
             tab.layout.validate()?;
@@ -1143,13 +1165,9 @@ pub enum ModelError {
     WorkspaceTabNotFound(WorkspaceTabId),
     ItemNotFound(ItemId),
     DuplicateItem(ItemId),
-    #[cfg(test)]
     ItemIndexMismatch(ItemId),
-    #[cfg(test)]
     InvalidActiveItem(PaneId),
-    #[cfg(test)]
     InvalidPaneTree,
-    #[cfg(test)]
     InvalidWorkspaceTabs,
     BadAxisPath,
     InvalidFlexes,
@@ -1401,6 +1419,22 @@ mod tests {
         assert_eq!(workspace.active_pane(), useful);
         assert_eq!(workspace.pane(useful).unwrap().items(), &[item]);
         workspace.validate().unwrap();
+    }
+
+    #[test]
+    fn restored_empty_outer_tabs_remain_loadable_until_pruned() {
+        let mut tabs = WorkspaceTabs::new();
+        let item = tabs.alloc_item();
+        let tab = tabs.push_standalone(item).unwrap();
+        tabs.workspace_mut(tab).unwrap().remove_item(item).unwrap();
+
+        let mut restored: WorkspaceTabs =
+            serde_json::from_str(&serde_json::to_string(&tabs).unwrap()).unwrap();
+        restored.validate().unwrap();
+        restored.prune_empty().unwrap();
+
+        assert!(restored.tabs().is_empty());
+        restored.validate().unwrap();
     }
 
     #[test]
